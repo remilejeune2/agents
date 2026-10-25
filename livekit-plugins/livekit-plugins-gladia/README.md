@@ -102,3 +102,31 @@ agent = Agent(
 
 # Rest of your agent setup...
 ```
+
+## End-of-turn detection on Gladia's regional API (`STTv2`)
+
+`STTv2` uses Gladia's regional realtime API (`eu1`, `us1`), which decides when the user has
+finished their turn from how they speak, not from silence alone. Let the session take that
+decision with `turn_detection="stt"`:
+
+```python
+from livekit.agents import AgentSession
+from livekit.plugins import gladia
+
+session = AgentSession(
+    stt=gladia.STTv2(
+        model="solaria-3",           # or a latency profile: "trantoria-1-fast", "solaria-3-fast"…
+        languages=["fr"],
+        region="eu1",
+        eager_eot_threshold=0.6,     # optional: start the reply before the turn is confirmed
+    ),
+    turn_handling={"turn_detection": "stt", "endpointing": {"min_delay": 0.0}},
+    # llm=..., tts=..., vad=silero.VAD.load() for interruptions
+)
+```
+
+The key is your regional account's key (`GLADIA_API_KEY` or `api_key`). Gladia's turn messages
+map to the session's events: `eager_end_of_turn` to a preflight transcript (preemptive
+generation), `turn_resumed` to an interim that drops it, and `end_of_turn` to one final transcript
+for the whole turn followed by the end of speech. A pause inside a turn never produces a final, so
+it never ends the turn.
