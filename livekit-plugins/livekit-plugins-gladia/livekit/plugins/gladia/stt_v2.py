@@ -25,6 +25,8 @@ Flux's:
     eager_end_of_turn            PREFLIGHT_TRANSCRIPT: the reply can start early
     turn_resumed                 INTERIM_TRANSCRIPT: the early reply is dropped
     end_of_turn (+ its final)    FINAL_TRANSCRIPT of the whole turn, then END_OF_SPEECH
+    speculation (keep)           the FINAL_TRANSCRIPT repeats the preflight's text, so the
+                                 early reply is kept
 
 There is one final per turn, never one per pause: with STT turn detection a final that
 arrives while the VAD hears silence commits the turn, so a final Gladia closes at a
@@ -79,19 +81,43 @@ class STTOptions:
     eot_threshold: NotGivenOr[float] = NOT_GIVEN
     eager_eot_threshold: NotGivenOr[float] = NOT_GIVEN
     min_end_of_turn_silence_ms: NotGivenOr[int] = NOT_GIVEN
+    silence_ms: NotGivenOr[int] = NOT_GIVEN
+    stop_s: NotGivenOr[float] = NOT_GIVEN
+    reeval_ms: NotGivenOr[int] = NOT_GIVEN
+    window_s: NotGivenOr[float] = NOT_GIVEN
+    vad_threshold: NotGivenOr[float] = NOT_GIVEN
+    speculation: bool = False
+    speculation_threshold: NotGivenOr[float] = NOT_GIVEN
     custom_vocabulary: list[str] = field(default_factory=list)
+
+
+# STTOptions field -> Gladia's end_of_turn field
+_END_OF_TURN_FIELDS = {
+    "eot_threshold": "eot_threshold",
+    "eager_eot_threshold": "eager_eot_threshold",
+    "min_end_of_turn_silence_ms": "min_end_of_turn_silence_when_confident",
+    "silence_ms": "silence_ms",
+    "stop_s": "stop_s",
+    "reeval_ms": "reeval_ms",
+    "window_s": "window_s",
+    "vad_threshold": "vad_threshold",
+}
 
 
 def _session_config(opts: STTOptions) -> dict[str, Any]:
     """The body of ``POST /v2/live``. Gladia refuses any field it doesn't know, so
     only options that were set are sent."""
-    end_of_turn: dict[str, Any] = {}
-    if is_given(opts.eot_threshold):
-        end_of_turn["eot_threshold"] = opts.eot_threshold
-    if is_given(opts.eager_eot_threshold):
-        end_of_turn["eager_eot_threshold"] = opts.eager_eot_threshold
-    if is_given(opts.min_end_of_turn_silence_ms):
-        end_of_turn["min_end_of_turn_silence_when_confident"] = opts.min_end_of_turn_silence_ms
+    end_of_turn: dict[str, Any] = {
+        gladia_field: getattr(opts, name)
+        for name, gladia_field in _END_OF_TURN_FIELDS.items()
+        if is_given(getattr(opts, name))
+    }
+    if opts.speculation:
+        end_of_turn["speculation"] = (
+            {"threshold": opts.speculation_threshold}
+            if is_given(opts.speculation_threshold)
+            else True
+        )
 
     config: dict[str, Any] = {
         "encoding": "wav/pcm",
@@ -105,9 +131,12 @@ def _session_config(opts: STTOptions) -> dict[str, Any]:
         "messages_config": {
             "receive_partial_transcripts": True,
             "receive_final_transcripts": True,
-            "receive_speech_events": True,
+            # a turn opens on its first words: speech_start and speech_end aren't used
+            "receive_speech_events": False,
             "receive_acknowledgments": False,
             "receive_post_processing_events": False,
+            # the speculation verdict is a realtime processing event
+            "receive_realtime_processing_events": opts.speculation,
         },
     }
     if opts.custom_vocabulary:
@@ -129,6 +158,13 @@ class STTv2(stt.STT):
         eot_threshold: NotGivenOr[float] = NOT_GIVEN,
         eager_eot_threshold: NotGivenOr[float] = NOT_GIVEN,
         min_end_of_turn_silence_ms: NotGivenOr[int] = NOT_GIVEN,
+        silence_ms: NotGivenOr[int] = NOT_GIVEN,
+        stop_s: NotGivenOr[float] = NOT_GIVEN,
+        reeval_ms: NotGivenOr[int] = NOT_GIVEN,
+        window_s: NotGivenOr[float] = NOT_GIVEN,
+        vad_threshold: NotGivenOr[float] = NOT_GIVEN,
+        speculation: bool = False,
+        speculation_threshold: NotGivenOr[float] = NOT_GIVEN,
         custom_vocabulary: NotGivenOr[list[str]] = NOT_GIVEN,
         api_key: NotGivenOr[str] = NOT_GIVEN,
         base_url: NotGivenOr[str] = NOT_GIVEN,
@@ -154,6 +190,22 @@ class STTv2(stt.STT):
             min_end_of_turn_silence_ms: Silence that must follow a turn judged complete
                 before its end is reported: higher cuts fewer users mid-sentence. Defaults
                 to Gladia's (0).
+            silence_ms: Silence, in milliseconds, before a pause is evaluated. Defaults to
+                Gladia's (200).
+            stop_s: Silence, in seconds, that ends the turn whatever the probability: the
+                longest a user who is done waits for the reply. Defaults to Gladia's (1.5).
+            reeval_ms: Interval, in milliseconds, between two evaluations of the same pause.
+                Defaults to Gladia's (200).
+            window_s: Audio, in seconds, an evaluation reads before the pause, at most 8.
+                Defaults to Gladia's (8).
+            vad_threshold: Speech probability, between 0 and 1, from which audio counts as
+                speech. Defaults to Gladia's (0.5).
+            speculation: Let Gladia judge whether the reply started on an early end of turn
+                still answers the final transcript, rather than requiring the same words. A
+                reply Gladia keeps is not regenerated, and its turn is recorded with the
+                preflight's text. Needs ``eager_eot_threshold``. Off by default.
+            speculation_threshold: Similarity, above 0 and at most 1, from which Gladia keeps
+                the early reply. Defaults to Gladia's (0.85). Needs ``speculation``.
             custom_vocabulary: Words to bias the transcription toward, such as product names.
             api_key: The account's key for the regional API. Defaults to ``GLADIA_API_KEY``.
             base_url: The session endpoint, overriding ``region``.
@@ -167,6 +219,8 @@ class STTv2(stt.STT):
         gladia_api_key = api_key if is_given(api_key) else os.environ.get("GLADIA_API_KEY")
         if not gladia_api_key:
             raise ValueError("Gladia API key is required. Set GLADIA_API_KEY or pass api_key")
+        if is_given(speculation_threshold) and not speculation:
+            raise ValueError("speculation_threshold needs speculation=True")
         if is_given(eager_eot_threshold):
             effective_eot = eot_threshold if is_given(eot_threshold) else DEFAULT_EOT_THRESHOLD
             if eager_eot_threshold > effective_eot:
@@ -184,6 +238,13 @@ class STTv2(stt.STT):
             eot_threshold=eot_threshold,
             eager_eot_threshold=eager_eot_threshold,
             min_end_of_turn_silence_ms=min_end_of_turn_silence_ms,
+            silence_ms=silence_ms,
+            stop_s=stop_s,
+            reeval_ms=reeval_ms,
+            window_s=window_s,
+            vad_threshold=vad_threshold,
+            speculation=speculation,
+            speculation_threshold=speculation_threshold,
             custom_vocabulary=custom_vocabulary if is_given(custom_vocabulary) else [],
         )
         self._session = http_session
@@ -239,6 +300,10 @@ class SpeechStreamv2(stt.SpeechStream):
         self._closing_turn: asyncio.TimerHandle | None = None
         # a turn closed on its partial: the final Gladia still owes belongs to that turn
         self._late_final = False
+        # with speculation, the preflight's text: Gladia's verdict on the final is about it
+        self._speculated: str | None = None
+        # the turn's final is in, its speculation verdict is not yet
+        self._awaiting_verdict = False
 
     def _turn_text(self) -> str:
         return " ".join(t for t in (*self._finals, self._partial) if t).strip()
@@ -268,12 +333,13 @@ class SpeechStreamv2(stt.SpeechStream):
             )
         )
 
-    def _end_turn(self) -> None:
+    def _end_turn(self, text: str | None = None) -> None:
         if self._closing_turn is not None:
             self._closing_turn.cancel()
             self._closing_turn = None
-        text = self._turn_text()
+        text = text or self._turn_text()
         self._finals, self._partial = [], ""
+        self._speculated, self._awaiting_verdict = None, False
         if not self._in_turn:
             return
         self._in_turn = False
@@ -299,7 +365,8 @@ class SpeechStreamv2(stt.SpeechStream):
 
     def _end_turn_unconfirmed(self) -> None:
         self._closing_turn = None
-        self._late_final = True
+        # without a verdict the final is in, and only a missing final is still owed
+        self._late_final = not self._awaiting_verdict
         self._end_turn()
 
     def _process_message(self, message: dict[str, Any]) -> None:
@@ -308,14 +375,27 @@ class SpeechStreamv2(stt.SpeechStream):
         if kind == "transcript":
             self._process_transcript(data)
         elif kind == "eager_end_of_turn":
-            if self._in_turn and (text := self._turn_text()):
+            # with speculation Gladia sends the text it will compare the final to; it is
+            # empty when Gladia had none, and then no verdict follows
+            engine_text = (data.get("text") or "").strip() if self._opts.speculation else ""
+            if self._in_turn and (text := engine_text or self._turn_text()):
+                self._speculated = engine_text or None
                 self._send(stt.SpeechEventType.PREFLIGHT_TRANSCRIPT, text)
         elif kind == "turn_resumed":
+            self._speculated = None
             # the pipeline drops its preemptive reply once an interim moves past the
             # preflight transcript
             if self._in_turn and (text := self._turn_text()):
                 self._send(stt.SpeechEventType.INTERIM_TRANSCRIPT, text)
+        elif kind == "speculation":
+            if self._awaiting_verdict:
+                results = data.get("results") or [{}]
+                keep = results[0].get("recommendation") == "keep"
+                # the same words as the preflight are what makes the pipeline keep its reply
+                self._end_turn(self._speculated if keep else None)
         elif kind == "end_of_turn":
+            if self._closing_turn is not None:
+                return  # already waiting for this turn's final
             if self._partial:
                 self._closing_turn = asyncio.get_running_loop().call_later(
                     FINAL_WAIT_S, self._end_turn_unconfirmed
@@ -344,6 +424,10 @@ class SpeechStreamv2(stt.SpeechStream):
         self._finals.append(text)
         self._partial = ""
         if self._closing_turn is not None:
+            if self._speculated is not None:
+                # Gladia's verdict on the early reply follows the final, within the same wait
+                self._awaiting_verdict = True
+                return
             self._end_turn()
             return
         self._send(stt.SpeechEventType.INTERIM_TRANSCRIPT, self._turn_text())

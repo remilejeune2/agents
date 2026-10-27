@@ -53,7 +53,8 @@ class _Recorded:
 
 
 @pytest.fixture
-async def v2_stream(monkeypatch):
+async def open_v2_stream(monkeypatch):
+    """Opens STTv2 streams that only process the messages a test gives them."""
     from livekit.plugins.gladia import STTv2, stt_v2
 
     async def idle(self) -> None:
@@ -61,11 +62,23 @@ async def v2_stream(monkeypatch):
 
     monkeypatch.setattr(stt_v2.SpeechStreamv2, "_run", idle)
     monkeypatch.setattr(stt_v2, "FINAL_WAIT_S", 0.05)
-    stream = STTv2(api_key="test-key", languages=["fr"]).stream()
-    recorded = _Recorded()
-    stream._event_ch = recorded
-    yield stream, recorded
-    await stream.aclose()
+    streams = []
+
+    def open_stream(**options):
+        stream = STTv2(api_key="test-key", languages=["fr"], **options).stream()
+        recorded = _Recorded()
+        stream._event_ch = recorded
+        streams.append(stream)
+        return stream, recorded
+
+    yield open_stream
+    for stream in streams:
+        await stream.aclose()
+
+
+@pytest.fixture
+async def v2_stream(open_v2_stream):
+    return open_v2_stream()
 
 
 def _partial(text: str) -> dict:
@@ -161,6 +174,149 @@ def test_v2_session_asks_gladia_to_end_turns_and_sends_only_the_options_set():
     assert config["language_config"] == {"languages": ["fr", "en"], "code_switching": True}
     assert config["realtime_processing"]["custom_vocabulary_config"] == {"vocabulary": ["Solaria"]}
     assert tuned._opts.base_url == "https://us1.api.gladia.io/v2/live"
+
+
+def test_v2_session_sends_every_end_of_turn_option_under_gladia_s_names():
+    from livekit.plugins.gladia import STTv2
+    from livekit.plugins.gladia.stt_v2 import _session_config
+
+    stt = STTv2(
+        api_key="test-key",
+        eot_threshold=0.85,
+        eager_eot_threshold=0.6,
+        min_end_of_turn_silence_ms=100,
+        silence_ms=150,
+        stop_s=1.0,
+        reeval_ms=100,
+        window_s=6.0,
+        vad_threshold=0.6,
+        speculation=True,
+        speculation_threshold=0.9,
+    )
+    config = _session_config(stt._opts)
+
+    assert config["end_of_turn"] == {
+        "eot_threshold": 0.85,
+        "eager_eot_threshold": 0.6,
+        "min_end_of_turn_silence_when_confident": 100,
+        "silence_ms": 150,
+        "stop_s": 1.0,
+        "reeval_ms": 100,
+        "window_s": 6.0,
+        "vad_threshold": 0.6,
+        "speculation": {"threshold": 0.9},
+    }
+    assert config["messages_config"]["receive_realtime_processing_events"] is True
+    assert config["messages_config"]["receive_speech_events"] is False
+
+
+def test_v2_session_asks_for_speculation_with_gladia_s_threshold_by_default():
+    from livekit.plugins.gladia import STTv2
+    from livekit.plugins.gladia.stt_v2 import _session_config
+
+    config = _session_config(STTv2(api_key="test-key", speculation=True)._opts)
+
+    assert config["end_of_turn"] == {"speculation": True}
+    assert config["messages_config"]["receive_realtime_processing_events"] is True
+    default = _session_config(STTv2(api_key="test-key")._opts)
+    assert default["messages_config"]["receive_realtime_processing_events"] is False
+
+
+def test_v2_rejects_a_speculation_threshold_without_speculation():
+    from livekit.plugins.gladia import STTv2
+
+    with pytest.raises(ValueError, match="speculation_threshold"):
+        STTv2(api_key="test-key", speculation_threshold=0.9)
+
+
+def _speculative_turn(final: str, recommendation: str | None) -> list[dict]:
+    messages = [
+        _partial("je voudrais réserver une table"),
+        {"type": "eager_end_of_turn", "data": {"text": "Je voudrais réserver une table"}},
+        {"type": "end_of_turn", "data": {"reason": "model", "text": "Je voudrais réserver"}},
+        _final(final),
+    ]
+    if recommendation:
+        messages.append(
+            {"type": "speculation", "data": {"results": [{"recommendation": recommendation}]}}
+        )
+    return messages
+
+
+async def test_v2_ends_the_turn_on_the_preflight_text_when_gladia_keeps_the_early_reply(
+    open_v2_stream,
+):
+    stream, recorded = open_v2_stream(eager_eot_threshold=0.6, speculation=True)
+    for message in _speculative_turn("Je voudrais réserver une table, svp.", "keep"):
+        stream._process_message(message)
+
+    assert recorded()[-3:] == [
+        ("PREFLIGHT_TRANSCRIPT", "Je voudrais réserver une table"),
+        ("FINAL_TRANSCRIPT", "Je voudrais réserver une table"),
+        ("END_OF_SPEECH", ""),
+    ]
+
+
+async def test_v2_ends_the_turn_on_the_final_when_gladia_discards_the_early_reply(
+    open_v2_stream,
+):
+    stream, recorded = open_v2_stream(eager_eot_threshold=0.6, speculation=True)
+    for message in _speculative_turn("Je voudrais réserver une table au Procope.", "discard"):
+        stream._process_message(message)
+
+    assert recorded()[-2:] == [
+        ("FINAL_TRANSCRIPT", "Je voudrais réserver une table au Procope."),
+        ("END_OF_SPEECH", ""),
+    ]
+
+
+async def test_v2_ends_the_turn_on_the_final_when_the_verdict_never_comes(open_v2_stream):
+    stream, recorded = open_v2_stream(eager_eot_threshold=0.6, speculation=True)
+    for message in _speculative_turn("Je voudrais réserver une table.", None):
+        stream._process_message(message)
+    assert recorded()[-1] == ("PREFLIGHT_TRANSCRIPT", "Je voudrais réserver une table")
+
+    await asyncio.sleep(0.1)
+    stream._process_message(_final("Merci."))
+
+    # the next final opens a new turn: it isn't taken for this turn's late final
+    assert recorded()[-4:] == [
+        ("FINAL_TRANSCRIPT", "Je voudrais réserver une table."),
+        ("END_OF_SPEECH", ""),
+        ("START_OF_SPEECH", ""),
+        ("INTERIM_TRANSCRIPT", "Merci."),
+    ]
+
+
+async def test_v2_without_speculation_ignores_the_text_of_an_eager_end_of_turn(v2_stream):
+    stream, recorded = v2_stream
+    for message in _speculative_turn("Je voudrais réserver une table, svp.", "keep"):
+        stream._process_message(message)
+
+    assert recorded()[-3:] == [
+        ("PREFLIGHT_TRANSCRIPT", "je voudrais réserver une table"),
+        ("FINAL_TRANSCRIPT", "Je voudrais réserver une table, svp."),
+        ("END_OF_SPEECH", ""),
+    ]
+
+
+async def test_v2_a_repeated_end_of_turn_does_not_drop_the_next_turn_s_final(v2_stream):
+    stream, recorded = v2_stream
+    stream._process_message(_partial("Bonjour"))
+    stream._process_message({"type": "end_of_turn", "data": {"reason": "model"}})
+    stream._process_message({"type": "end_of_turn", "data": {"reason": "timeout"}})
+    stream._process_message(_final("Bonjour."))
+    await asyncio.sleep(0.1)
+    stream._process_message(_final("Au revoir."))
+
+    assert recorded() == [
+        ("START_OF_SPEECH", ""),
+        ("INTERIM_TRANSCRIPT", "Bonjour"),
+        ("FINAL_TRANSCRIPT", "Bonjour."),
+        ("END_OF_SPEECH", ""),
+        ("START_OF_SPEECH", ""),
+        ("INTERIM_TRANSCRIPT", "Au revoir."),
+    ]
 
 
 def test_v2_rejects_an_eager_threshold_above_the_end_of_turn_one():
