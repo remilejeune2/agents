@@ -21,3 +21,5 @@ V2Models = Literal[
 ]
 
 V2Regions = Literal["eu1", "us1"]
+
+TTSModels = Literal["seldonia-1", "seldonia-1-small", "seldonia-multi-1"]

@@ -19,9 +19,20 @@ See https://docs.livekit.io/agents/integrations/stt/gladia/ for more information
 
 from .stt import STT, AudioEnergyFilter, SpeechStream
 from .stt_v2 import SpeechStreamv2, STTv2
+from .tts import TTS, ChunkedStream, SynthesizeStream
 from .version import __version__
 
-__all__ = ["STT", "SpeechStream", "STTv2", "SpeechStreamv2", "AudioEnergyFilter", "__version__"]
+__all__ = [
+    "STT",
+    "SpeechStream",
+    "STTv2",
+    "SpeechStreamv2",
+    "TTS",
+    "ChunkedStream",
+    "SynthesizeStream",
+    "AudioEnergyFilter",
+    "__version__",
+]
 
 
 from livekit.agents import Plugin
