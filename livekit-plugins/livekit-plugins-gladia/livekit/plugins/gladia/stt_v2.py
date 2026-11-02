@@ -40,8 +40,9 @@ import json
 import os
 import time
 import weakref
+from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import aiohttp
 
@@ -62,7 +63,7 @@ from ._utils import PeriodicCollector
 from .log import logger
 from .models import V2Models, V2Regions
 
-SAMPLE_RATE = 16000
+SAMPLE_RATES = (8000, 16000, 32000, 44100, 48000)
 AUDIO_CHUNK_MS = 100
 DEFAULT_EOT_THRESHOLD = 0.9
 
@@ -89,6 +90,15 @@ class STTOptions:
     speculation: bool = False
     speculation_threshold: NotGivenOr[float] = NOT_GIVEN
     custom_vocabulary: list[str] = field(default_factory=list)
+    sample_rate: int = 16000
+    speech_threshold: NotGivenOr[float | Literal["auto"]] = NOT_GIVEN
+    diarization: bool = False
+    number_of_speakers: NotGivenOr[int] = NOT_GIVEN
+    max_speakers: NotGivenOr[int] = NOT_GIVEN
+    numerals: NotGivenOr[bool | str] = NOT_GIVEN
+    emails: bool = False
+    addresses: NotGivenOr[bool | dict[str, Any]] = NOT_GIVEN
+    pii: NotGivenOr[bool | dict[str, Any]] = NOT_GIVEN
 
 
 # STTOptions field -> Gladia's end_of_turn field
@@ -121,7 +131,7 @@ def _session_config(opts: STTOptions) -> dict[str, Any]:
 
     config: dict[str, Any] = {
         "encoding": "wav/pcm",
-        "sample_rate": SAMPLE_RATE,
+        "sample_rate": opts.sample_rate,
         "bit_depth": 16,
         "channels": 1,
         "model": opts.model,
@@ -144,6 +154,31 @@ def _session_config(opts: STTOptions) -> dict[str, Any]:
             "custom_vocabulary": True,
             "custom_vocabulary_config": {"vocabulary": opts.custom_vocabulary},
         }
+    if is_given(opts.speech_threshold):
+        config["pre_processing"] = {"speech_threshold": opts.speech_threshold}
+    if opts.diarization:
+        config["diarization"] = True
+        diarization_config = {
+            name: value
+            for name, value in (
+                ("number_of_speakers", opts.number_of_speakers),
+                ("max_speakers", opts.max_speakers),
+            )
+            if is_given(value)
+        }
+        if diarization_config:
+            config["diarization_config"] = diarization_config
+    if is_given(opts.numerals):
+        # a country code sets the country whose phone numbers and dates are written
+        config["numerals"] = (
+            {"region": opts.numerals} if isinstance(opts.numerals, str) else opts.numerals
+        )
+    if opts.emails:
+        config["emails"] = True
+    if is_given(opts.addresses):
+        config["addresses"] = opts.addresses
+    if is_given(opts.pii):
+        config["pii"] = opts.pii
     return config
 
 
@@ -166,6 +201,15 @@ class STTv2(stt.STT):
         speculation: bool = False,
         speculation_threshold: NotGivenOr[float] = NOT_GIVEN,
         custom_vocabulary: NotGivenOr[list[str]] = NOT_GIVEN,
+        sample_rate: int = 16000,
+        speech_threshold: NotGivenOr[float | Literal["auto"]] = NOT_GIVEN,
+        diarization: bool = False,
+        number_of_speakers: NotGivenOr[int] = NOT_GIVEN,
+        max_speakers: NotGivenOr[int] = NOT_GIVEN,
+        numerals: NotGivenOr[bool | str] = NOT_GIVEN,
+        emails: bool = False,
+        addresses: NotGivenOr[bool | dict[str, Any]] = NOT_GIVEN,
+        pii: NotGivenOr[bool | dict[str, Any]] = NOT_GIVEN,
         api_key: NotGivenOr[str] = NOT_GIVEN,
         base_url: NotGivenOr[str] = NOT_GIVEN,
         http_session: aiohttp.ClientSession | None = None,
@@ -207,18 +251,45 @@ class STTv2(stt.STT):
             speculation_threshold: Similarity, above 0 and at most 1, from which Gladia keeps
                 the early reply. Defaults to Gladia's (0.85). Needs ``speculation``.
             custom_vocabulary: Words to bias the transcription toward, such as product names.
+            sample_rate: The rate the audio is sent at: 8000, 16000, 32000, 44100 or 48000
+                Hz. Defaults to 16000; 8000 suits telephony audio.
+            speech_threshold: Sensitivity of Gladia's voice activity detector, between 0
+                and 1: lower hears quieter or more distant speech, higher ignores more
+                background voices. ``"auto"`` (solaria-3) adapts to the speaker. Defaults
+                to Gladia's (0.5).
+            diarization: Label each turn with its speaker (``speaker_id`` ``"S0"``,
+                ``"S1"``...: the speaker of most of the turn's finals). Off by default.
+            number_of_speakers: The number of speakers, when it is known. Needs
+                ``diarization``.
+            max_speakers: The most speakers to tell apart. Needs ``diarization``.
+            numerals: Write spoken numbers, amounts and times with digits ("$1,355",
+                "9:15"). True uses the countries of the language spoken; a country code
+                (``"FR"``, ``"CH"``) writes phone numbers and dates the way it does.
+            emails: Write dictated e-mail addresses as addresses. Off by default.
+            addresses: Write dictated postal addresses in their standard form: True, or
+                Gladia's options (``{"country": "FR", "city": "Paris"}``).
+            pii: Redact personal data (names, phone numbers, card numbers...): True, or
+                Gladia's options (``{"entities": "pci", "mode": "mask"}``). Gladia then
+                sends no partials: interim transcripts come with each final only.
             api_key: The account's key for the regional API. Defaults to ``GLADIA_API_KEY``.
             base_url: The session endpoint, overriding ``region``.
             http_session: The HTTP session to use. Defaults to the agent's.
         """
         super().__init__(
             capabilities=stt.STTCapabilities(
-                streaming=True, interim_results=True, offline_recognize=False
+                streaming=True,
+                interim_results=True,
+                offline_recognize=False,
+                diarization=diarization,
             )
         )
         gladia_api_key = api_key if is_given(api_key) else os.environ.get("GLADIA_API_KEY")
         if not gladia_api_key:
             raise ValueError("Gladia API key is required. Set GLADIA_API_KEY or pass api_key")
+        if sample_rate not in SAMPLE_RATES:
+            raise ValueError(f"sample_rate must be one of {SAMPLE_RATES}, got {sample_rate}")
+        if (is_given(number_of_speakers) or is_given(max_speakers)) and not diarization:
+            raise ValueError("number_of_speakers and max_speakers need diarization=True")
         if is_given(speculation_threshold) and not speculation:
             raise ValueError("speculation_threshold needs speculation=True")
         if is_given(eager_eot_threshold):
@@ -246,6 +317,15 @@ class STTv2(stt.STT):
             speculation=speculation,
             speculation_threshold=speculation_threshold,
             custom_vocabulary=custom_vocabulary if is_given(custom_vocabulary) else [],
+            sample_rate=sample_rate,
+            speech_threshold=speech_threshold,
+            diarization=diarization,
+            number_of_speakers=number_of_speakers,
+            max_speakers=max_speakers,
+            numerals=numerals,
+            emails=emails,
+            addresses=addresses,
+            pii=pii,
         )
         self._session = http_session
         self._streams = weakref.WeakSet[SpeechStreamv2]()
@@ -285,7 +365,7 @@ class STTv2(stt.STT):
 
 class SpeechStreamv2(stt.SpeechStream):
     def __init__(self, *, stt: STTv2, opts: STTOptions, conn_options: APIConnectOptions) -> None:
-        super().__init__(stt=stt, conn_options=conn_options, sample_rate=SAMPLE_RATE)
+        super().__init__(stt=stt, conn_options=conn_options, sample_rate=opts.sample_rate)
         self._gladia = stt
         self._opts = opts
         self._language = LanguageCode(opts.languages[0] if opts.languages else "en")
@@ -296,6 +376,8 @@ class SpeechStreamv2(stt.SpeechStream):
         # the turn being spoken: the finals Gladia closed inside it, and the open partial
         self._finals: list[str] = []
         self._partial = ""
+        # with diarization, the speaker of each of the turn's finals
+        self._speakers: list[int] = []
         self._in_turn = False
         self._closing_turn: asyncio.TimerHandle | None = None
         # a turn closed on its partial: the final Gladia still owes belongs to that turn
@@ -308,12 +390,19 @@ class SpeechStreamv2(stt.SpeechStream):
     def _turn_text(self) -> str:
         return " ".join(t for t in (*self._finals, self._partial) if t).strip()
 
-    def _send(self, event_type: stt.SpeechEventType, text: str | None = None) -> None:
-        alternatives = (
-            [stt.SpeechData(language=self._language, text=text, confidence=1.0)]
-            if text is not None
-            else []
+    def _turn_speaker(self) -> str | None:
+        # a turn may hold another voice (a cough, someone nearby): it is the main one's
+        if not self._speakers:
+            return None
+        return f"S{Counter(self._speakers).most_common(1)[0][0]}"
+
+    def _speech_data(self, text: str) -> stt.SpeechData:
+        return stt.SpeechData(
+            language=self._language, text=text, confidence=1.0, speaker_id=self._turn_speaker()
         )
+
+    def _send(self, event_type: stt.SpeechEventType, text: str | None = None) -> None:
+        alternatives = [self._speech_data(text)] if text is not None else []
         self._event_ch.send_nowait(
             stt.SpeechEvent(type=event_type, request_id=self._request_id, alternatives=alternatives)
         )
@@ -338,7 +427,8 @@ class SpeechStreamv2(stt.SpeechStream):
             self._closing_turn.cancel()
             self._closing_turn = None
         text = text or self._turn_text()
-        self._finals, self._partial = [], ""
+        data = self._speech_data(text)
+        self._finals, self._partial, self._speakers = [], "", []
         self._speculated, self._awaiting_verdict = None, False
         if not self._in_turn:
             return
@@ -349,9 +439,7 @@ class SpeechStreamv2(stt.SpeechStream):
                 stt.SpeechEvent(
                     type=stt.SpeechEventType.FINAL_TRANSCRIPT,
                     request_id=self._request_id,
-                    alternatives=[
-                        stt.SpeechData(language=self._language, text=text, confidence=1.0)
-                    ],
+                    alternatives=[data],
                     speech_end_time=now,
                 )
             )
@@ -423,6 +511,8 @@ class SpeechStreamv2(stt.SpeechStream):
             return
         self._finals.append(text)
         self._partial = ""
+        if isinstance(speaker := utterance.get("speaker"), int):
+            self._speakers.append(speaker)
         if self._closing_turn is not None:
             if self._speculated is not None:
                 # Gladia's verdict on the early reply follows the final, within the same wait
@@ -480,9 +570,9 @@ class SpeechStreamv2(stt.SpeechStream):
         async def send_task() -> None:
             nonlocal closing
             chunker = utils.audio.AudioByteStream(
-                sample_rate=SAMPLE_RATE,
+                sample_rate=self._opts.sample_rate,
                 num_channels=1,
-                samples_per_channel=SAMPLE_RATE * AUDIO_CHUNK_MS // 1000,
+                samples_per_channel=self._opts.sample_rate * AUDIO_CHUNK_MS // 1000,
             )
             async for data in self._input_ch:
                 frames: list[rtc.AudioFrame] = (

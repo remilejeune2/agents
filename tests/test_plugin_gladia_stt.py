@@ -392,3 +392,70 @@ async def test_v2_streams_the_audio_and_turns_gladia_messages_into_a_turn():
         ("FINAL_TRANSCRIPT", ["Bonjour."]),
         ("END_OF_SPEECH", []),
     ]
+
+
+def test_v2_session_sends_audio_speaker_and_formatting_options():
+    from livekit.plugins.gladia import STTv2
+    from livekit.plugins.gladia.stt_v2 import _session_config
+
+    default = _session_config(STTv2(api_key="test-key")._opts)
+    for key in ("pre_processing", "diarization", "numerals", "emails", "addresses", "pii"):
+        assert key not in default
+    assert default["sample_rate"] == 16000
+
+    stt = STTv2(
+        api_key="test-key",
+        sample_rate=8000,
+        speech_threshold="auto",
+        diarization=True,
+        max_speakers=2,
+        numerals="CH",
+        emails=True,
+        addresses={"country": "FR"},
+        pii={"entities": "pci", "mode": "mask"},
+    )
+    config = _session_config(stt._opts)
+    assert config["sample_rate"] == 8000
+    assert config["pre_processing"] == {"speech_threshold": "auto"}
+    assert config["diarization"] is True
+    assert config["diarization_config"] == {"max_speakers": 2}
+    assert config["numerals"] == {"region": "CH"}
+    assert config["emails"] is True
+    assert config["addresses"] == {"country": "FR"}
+    assert config["pii"] == {"entities": "pci", "mode": "mask"}
+    assert stt.capabilities.diarization is True
+    assert _session_config(STTv2(api_key="test-key", numerals=True)._opts)["numerals"] is True
+
+
+def test_v2_rejects_speaker_counts_without_diarization_and_unknown_rates():
+    from livekit.plugins.gladia import STTv2
+
+    with pytest.raises(ValueError, match="diarization"):
+        STTv2(api_key="test-key", max_speakers=2)
+    with pytest.raises(ValueError, match="sample_rate"):
+        STTv2(api_key="test-key", sample_rate=22050)
+
+
+async def test_v2_labels_a_turn_with_the_speaker_of_most_of_its_finals(v2_stream):
+    stream, recorded = v2_stream
+
+    def final(text: str, speaker: int) -> dict:
+        message = _final(text)
+        message["data"]["utterance"]["speaker"] = speaker
+        return message
+
+    for message in (
+        final("Bonjour.", 1),
+        final("Hm.", 0),
+        final("Je voudrais un rendez-vous.", 1),
+        {"type": "end_of_turn", "data": {}},
+        final("Oui ?", 0),
+        {"type": "end_of_turn", "data": {}},
+    ):
+        stream._process_message(message)
+
+    finals = [e for e in recorded.events if e.type.name == "FINAL_TRANSCRIPT"]
+    assert [(e.alternatives[0].text, e.alternatives[0].speaker_id) for e in finals] == [
+        ("Bonjour. Hm. Je voudrais un rendez-vous.", "S1"),
+        ("Oui ?", "S0"),
+    ]
