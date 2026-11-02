@@ -459,3 +459,90 @@ async def test_v2_labels_a_turn_with_the_speaker_of_most_of_its_finals(v2_stream
         ("Bonjour. Hm. Je voudrais un rendez-vous.", "S1"),
         ("Oui ?", "S0"),
     ]
+
+
+async def test_v2_keeps_for_a_reconnect_only_the_audio_after_the_last_final(v2_stream):
+    stream, _ = v2_stream
+    second = 16000 * 2
+    stream._keep_for_replay(b"\x01\x00" * 16000 * 3)  # 3 s sent
+    final = _final("Bonjour.")
+    final["data"]["utterance"]["end"] = 2.0
+    stream._process_message(final)
+
+    assert len(stream._replay) == second
+    assert stream._replay_start == 2 * second
+
+    # a long silence after it: a new session hears 15 s at most
+    stream._keep_for_replay(b"\x00\x00" * 16000 * 30)
+    assert len(stream._replay) == 15 * second
+
+
+class _ScriptedWebsocket:
+    """A Gladia websocket that drops after its messages, or closes cleanly."""
+
+    def __init__(self, messages, *, drop: bool):
+        self.messages, self.drop, self.sent = messages, drop, []
+        self.close_code = 1006 if drop else 1000
+
+    async def send_bytes(self, data):
+        self.sent.append(data)
+
+    async def send_str(self, data):
+        pass
+
+    async def close(self):
+        pass
+
+    def __aiter__(self):
+        return self._iter()
+
+    async def _iter(self):
+        import aiohttp
+
+        for message in self.messages:
+            yield SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data=json.dumps(message))
+        if not self.drop:
+            await asyncio.Event().wait()
+
+
+async def test_v2_a_dropped_connection_resumes_the_turn_in_a_new_session(monkeypatch):
+    from livekit.agents import APIConnectOptions
+    from livekit.plugins.gladia import STTv2
+
+    first = _ScriptedWebsocket([_partial("Je voudrais")], drop=True)
+    second = _ScriptedWebsocket(
+        [_final("Je voudrais un rendez-vous."), {"type": "end_of_turn", "data": {}}], drop=False
+    )
+    sockets = iter([first, second])
+    stream = STTv2(api_key="test-key").stream(
+        conn_options=APIConnectOptions(max_retry=1, retry_interval=0)
+    )
+
+    async def connect():
+        return next(sockets)
+
+    monkeypatch.setattr(stream, "_connect_ws", connect)
+    stream._keep_for_replay(b"\x01\x00" * 1600)  # audio of the open utterance
+
+    events = []
+
+    async def collect():
+        async for event in stream:
+            events.append(
+                (event.type.name, event.alternatives[0].text if event.alternatives else "")
+            )
+            if event.type.name == "END_OF_SPEECH":
+                return
+
+    await asyncio.wait_for(collect(), timeout=3)
+    await stream.aclose()
+
+    # the turn was not ended on the drop: the new session finished it
+    assert events == [
+        ("START_OF_SPEECH", ""),
+        ("INTERIM_TRANSCRIPT", "Je voudrais"),
+        ("INTERIM_TRANSCRIPT", "Je voudrais un rendez-vous."),
+        ("FINAL_TRANSCRIPT", "Je voudrais un rendez-vous."),
+        ("END_OF_SPEECH", ""),
+    ]
+    assert second.sent[0] == b"\x01\x00" * 1600

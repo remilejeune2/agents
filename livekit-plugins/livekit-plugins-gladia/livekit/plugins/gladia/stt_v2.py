@@ -51,6 +51,7 @@ from livekit.agents import (
     DEFAULT_API_CONNECT_OPTIONS,
     APIConnectionError,
     APIConnectOptions,
+    APIError,
     APIStatusError,
     LanguageCode,
     stt,
@@ -66,6 +67,11 @@ from .models import V2Models, V2Regions
 SAMPLE_RATES = (8000, 16000, 32000, 44100, 48000)
 AUDIO_CHUNK_MS = 100
 DEFAULT_EOT_THRESHOLD = 0.9
+
+REPLAY_MAX_S = 15.0
+"""The most audio a reconnect sends the new session again: the utterance that was open
+when the connection dropped. Gladia had not transcribed it for good, and a session
+cannot be rejoined (its URL's token is single-use)."""
 
 FINAL_WAIT_S = 0.5
 """How long the end of a turn waits for the final of its last words. Gladia sends
@@ -386,6 +392,10 @@ class SpeechStreamv2(stt.SpeechStream):
         self._speculated: str | None = None
         # the turn's final is in, its speculation verdict is not yet
         self._awaiting_verdict = False
+        # the audio sent since the session's last final, and where it starts in the
+        # session: a reconnect sends it to the new session
+        self._replay = bytearray()
+        self._replay_start = 0
 
     def _turn_text(self) -> str:
         return " ".join(t for t in (*self._finals, self._partial) if t).strip()
@@ -493,8 +503,27 @@ class SpeechStreamv2(stt.SpeechStream):
         elif kind == "error":
             logger.warning("gladia sent an error", extra={"lk.pii.data": data})
 
+    def _bytes_per_second(self) -> int:
+        return self._opts.sample_rate * 2
+
+    def _keep_for_replay(self, pcm: bytes) -> None:
+        self._replay += pcm
+        excess = len(self._replay) - int(REPLAY_MAX_S * self._bytes_per_second())
+        if excess > 0:
+            del self._replay[:excess]
+            self._replay_start += excess
+
+    def _drop_replay_until(self, end_s: float) -> None:
+        """The audio up to a final's end is transcribed for good: no replay needs it."""
+        end = int(end_s * self._opts.sample_rate) * 2
+        if end > self._replay_start:
+            del self._replay[: end - self._replay_start]
+            self._replay_start = end
+
     def _process_transcript(self, data: dict[str, Any]) -> None:
         utterance = data.get("utterance") or {}
+        if data.get("is_final") and isinstance(end := utterance.get("end"), (int, float)):
+            self._drop_replay_until(end)
         text = (utterance.get("text") or "").strip()
         if language := utterance.get("language"):
             self._language = LanguageCode(language)
@@ -569,6 +598,12 @@ class SpeechStreamv2(stt.SpeechStream):
 
         async def send_task() -> None:
             nonlocal closing
+            # a new session: what the last one had not transcribed for good comes first
+            replay, self._replay, self._replay_start = bytes(self._replay), bytearray(), 0
+            step = self._bytes_per_second()
+            for i in range(0, len(replay), step):
+                self._keep_for_replay(replay[i : i + step])
+                await ws.send_bytes(replay[i : i + step])
             chunker = utils.audio.AudioByteStream(
                 sample_rate=self._opts.sample_rate,
                 num_channels=1,
@@ -582,7 +617,9 @@ class SpeechStreamv2(stt.SpeechStream):
                 )
                 for frame in frames:
                     self._audio_duration_collector.push(frame.duration)
-                    await ws.send_bytes(frame.data.tobytes())
+                    pcm = frame.data.tobytes()
+                    self._keep_for_replay(pcm)
+                    await ws.send_bytes(pcm)
             self._audio_duration_collector.flush()
             closing = True
             await ws.send_str(json.dumps({"type": "stop_recording"}))
@@ -602,12 +639,19 @@ class SpeechStreamv2(stt.SpeechStream):
                 )
 
         tasks = [asyncio.create_task(send_task()), asyncio.create_task(recv_task())]
+        # a dropped connection is retried in a new session, which hears the open
+        # utterance again: the turn goes on there rather than ending on half its words
+        resumed = False
         try:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
             for task in done:
                 task.result()
             await asyncio.gather(*tasks)
+        except APIError as e:
+            resumed = e.retryable
+            raise
         finally:
             await utils.aio.gracefully_cancel(*tasks)
-            self._end_turn()
+            if not resumed:
+                self._end_turn()
             await ws.close()
